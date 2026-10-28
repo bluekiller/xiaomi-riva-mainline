@@ -20,6 +20,7 @@
 #include <linux/etherdevice.h>
 #include <linux/firmware.h>
 #include <linux/bitops.h>
+#include <linux/module.h>
 #include <linux/rpmsg.h>
 #include "smd.h"
 #include "firmware.h"
@@ -82,6 +83,84 @@ static struct wcn36xx_cfg_val wcn36xx_cfg_vals[] = {
 	WCN36XX_CFG_VAL(ENABLE_DYNAMIC_RA_START_RATE, 133), /* MCS 5 */
 	WCN36XX_CFG_VAL(LINK_FAIL_TX_CNT, 1000),
 };
+
+/*
+ * HAL config for 2.4 GHz-only iris chips, from the WCN3610 series posted
+ * upstream (values from the downstream prima driver). With the default table
+ * that series measured ~95% packet loss; ENABLE_DYNAMIC_RA_START_RATE=0 and
+ * BTC_EXECUTION_MODE=2 brought it to 0%.
+ */
+static struct wcn36xx_cfg_val wcn3610_cfg_vals[] = {
+	WCN36XX_CFG_VAL(CURRENT_TX_ANTENNA, 1),
+	WCN36XX_CFG_VAL(CURRENT_RX_ANTENNA, 1),
+	WCN36XX_CFG_VAL(LOW_GAIN_OVERRIDE, 0),
+	WCN36XX_CFG_VAL(POWER_STATE_PER_CHAIN, 785),
+	WCN36XX_CFG_VAL(CAL_PERIOD, 5),
+	WCN36XX_CFG_VAL(CAL_CONTROL, 1),
+	WCN36XX_CFG_VAL(PROXIMITY, 0),
+	WCN36XX_CFG_VAL(NETWORK_DENSITY, 3),
+	WCN36XX_CFG_VAL(MAX_MEDIUM_TIME, 6000),
+	WCN36XX_CFG_VAL(MAX_MPDUS_IN_AMPDU, 64),
+	WCN36XX_CFG_VAL(RTS_THRESHOLD, 2347),
+	WCN36XX_CFG_VAL(SHORT_RETRY_LIMIT, 15),
+	WCN36XX_CFG_VAL(LONG_RETRY_LIMIT, 15),
+	WCN36XX_CFG_VAL(FRAGMENTATION_THRESHOLD, 8000),
+	WCN36XX_CFG_VAL(DYNAMIC_THRESHOLD_ZERO, 5),
+	WCN36XX_CFG_VAL(DYNAMIC_THRESHOLD_ONE, 10),
+	WCN36XX_CFG_VAL(DYNAMIC_THRESHOLD_TWO, 15),
+	WCN36XX_CFG_VAL(FIXED_RATE, 0),
+	WCN36XX_CFG_VAL(RETRYRATE_POLICY, 4),
+	WCN36XX_CFG_VAL(RETRYRATE_SECONDARY, 131),
+	WCN36XX_CFG_VAL(RETRYRATE_TERTIARY, 129),
+	WCN36XX_CFG_VAL(FORCE_POLICY_PROTECTION, 5),
+	WCN36XX_CFG_VAL(FIXED_RATE_MULTICAST_24GHZ, 1),
+	WCN36XX_CFG_VAL(FIXED_RATE_MULTICAST_5GHZ, 5),
+	WCN36XX_CFG_VAL(DEFAULT_RATE_INDEX_5GHZ, 5),
+	WCN36XX_CFG_VAL(DEFAULT_RATE_INDEX_24GHZ, 6),
+	WCN36XX_CFG_VAL(MAX_BA_SESSIONS, 40),
+	WCN36XX_CFG_VAL(PS_DATA_INACTIVITY_TIMEOUT, 200),
+	WCN36XX_CFG_VAL(PS_ENABLE_BCN_FILTER, 1),
+	WCN36XX_CFG_VAL(PS_ENABLE_RSSI_MONITOR, 1),
+	WCN36XX_CFG_VAL(NUM_BEACON_PER_RSSI_AVERAGE, 20),
+	WCN36XX_CFG_VAL(STATS_PERIOD, 10),
+	WCN36XX_CFG_VAL(CFP_MAX_DURATION, 30000),
+	WCN36XX_CFG_VAL(FRAME_TRANS_ENABLED, 0),
+	WCN36XX_CFG_VAL(BA_THRESHOLD_HIGH, 128),
+	WCN36XX_CFG_VAL(MAX_BA_BUFFERS, 2560),
+	WCN36XX_CFG_VAL(DYNAMIC_PS_POLL_VALUE, 0),
+	WCN36XX_CFG_VAL(TX_PWR_CTRL_ENABLE, 1),
+	WCN36XX_CFG_VAL(ENABLE_CLOSE_LOOP, 1),
+	WCN36XX_CFG_VAL(ENABLE_LPWR_IMG_TRANSITION, 0),
+	WCN36XX_CFG_VAL(BTC_EXECUTION_MODE, 2),
+	WCN36XX_CFG_VAL(BTC_STATIC_OPP_WLAN_ACTIVE_WLAN_LEN, 90000),
+	WCN36XX_CFG_VAL(BTC_STATIC_OPP_WLAN_ACTIVE_BT_LEN, 60000),
+	WCN36XX_CFG_VAL(BTC_STATIC_OPP_WLAN_IDLE_WLAN_LEN, 30000),
+	WCN36XX_CFG_VAL(BTC_STATIC_OPP_WLAN_IDLE_BT_LEN, 120000),
+	WCN36XX_CFG_VAL(BTC_FAST_WLAN_CONN_PREF, 1),
+	WCN36XX_CFG_VAL(BTC_STATIC_LEN_LE_BT, 120000),
+	WCN36XX_CFG_VAL(BTC_STATIC_LEN_LE_WLAN, 30000),
+	WCN36XX_CFG_VAL(MAX_ASSOC_LIMIT, 10),
+	WCN36XX_CFG_VAL(ENABLE_MCC_ADAPTIVE_SCHEDULER, 0),
+	WCN36XX_CFG_VAL(ENABLE_DYNAMIC_RA_START_RATE, 0),
+	WCN36XX_CFG_VAL(LINK_FAIL_TX_CNT, 1000),
+};
+
+static bool wcn3610_cfg;
+module_param(wcn3610_cfg, bool, 0644);
+MODULE_PARM_DESC(wcn3610_cfg, "Use the WCN3610 HAL config and no firmware powersave on WCN3620 (applies at interface start)");
+
+static int ra_start_rate = -1;
+module_param(ra_start_rate, int, 0644);
+MODULE_PARM_DESC(ra_start_rate, "Override ENABLE_DYNAMIC_RA_START_RATE (-1: keep)");
+
+static int btc_mode = -1;
+module_param(btc_mode, int, 0644);
+MODULE_PARM_DESC(btc_mode, "Override BTC_EXECUTION_MODE (-1: keep)");
+
+static bool wcn36xx_use_wcn3610_cfg(struct wcn36xx *wcn)
+{
+	return wcn3610_cfg && wcn->rf_id == RF_IRIS_WCN3620;
+}
 
 static struct wcn36xx_cfg_val wcn3680_cfg_vals[] = {
 	WCN36XX_CFG_VAL(CURRENT_TX_ANTENNA, 1),
@@ -617,6 +696,7 @@ int wcn36xx_smd_start(struct wcn36xx *wcn)
 	size_t len;
 	int cfg_elements;
 	static struct wcn36xx_cfg_val *cfg_vals;
+	bool btc_set = false;
 
 	mutex_lock(&wcn->hal_mutex);
 	INIT_HAL_MSG(msg_body, WCN36XX_HAL_START_REQ);
@@ -632,17 +712,38 @@ int wcn36xx_smd_start(struct wcn36xx *wcn)
 	if (wcn->rf_id == RF_IRIS_WCN3680) {
 		cfg_vals = wcn3680_cfg_vals;
 		cfg_elements = ARRAY_SIZE(wcn3680_cfg_vals);
+	} else if (wcn36xx_use_wcn3610_cfg(wcn)) {
+		cfg_vals = wcn3610_cfg_vals;
+		cfg_elements = ARRAY_SIZE(wcn3610_cfg_vals);
 	} else {
 		cfg_vals = wcn36xx_cfg_vals;
 		cfg_elements = ARRAY_SIZE(wcn36xx_cfg_vals);
 	}
 
 	for (i = 0; i < cfg_elements; i++) {
-		ret = put_cfg_tlv_u32(wcn, &len, cfg_vals[i].cfg_id,
-				      cfg_vals[i].value);
+		u32 id = cfg_vals[i].cfg_id, val = cfg_vals[i].value;
+
+		if (id == WCN36XX_HAL_CFG_ENABLE_DYNAMIC_RA_START_RATE &&
+		    ra_start_rate >= 0)
+			val = ra_start_rate;
+		if (id == WCN36XX_HAL_CFG_BTC_EXECUTION_MODE && btc_mode >= 0) {
+			val = btc_mode;
+			btc_set = true;
+		}
+		ret = put_cfg_tlv_u32(wcn, &len, id, val);
 		if (ret)
 			goto out;
 	}
+	if (btc_mode >= 0 && !btc_set) {
+		ret = put_cfg_tlv_u32(wcn, &len,
+				      WCN36XX_HAL_CFG_BTC_EXECUTION_MODE,
+				      btc_mode);
+		if (ret)
+			goto out;
+	}
+	wcn36xx_info("hal start: %s cfg, ra_start_rate %d, btc_mode %d\n",
+		     cfg_vals == wcn3610_cfg_vals ? "wcn3610" : "default",
+		     ra_start_rate, btc_mode);
 	body->header.len = len;
 	body->params.len = len - sizeof(*body);
 
@@ -2380,7 +2481,9 @@ int wcn36xx_smd_feature_caps_exchange(struct wcn36xx *wcn)
 	mutex_lock(&wcn->hal_mutex);
 	INIT_HAL_MSG(msg_body, WCN36XX_HAL_FEATURE_CAPS_EXCHANGE_REQ);
 
-	wcn36xx_firmware_set_feat_caps(msg_body.feat_caps, STA_POWERSAVE);
+	/* Firmware powersave gives BMPS errors with the WCN3610 config */
+	if (!wcn36xx_use_wcn3610_cfg(wcn))
+		wcn36xx_firmware_set_feat_caps(msg_body.feat_caps, STA_POWERSAVE);
 	if (wcn->rf_id == RF_IRIS_WCN3680) {
 		wcn36xx_firmware_set_feat_caps(msg_body.feat_caps, DOT11AC);
 		wcn36xx_firmware_set_feat_caps(msg_body.feat_caps, WLAN_CH144);
