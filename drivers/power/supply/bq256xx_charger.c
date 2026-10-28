@@ -2,6 +2,7 @@
 // BQ256XX Battery Charger Driver
 // Copyright (C) 2020 Texas Instruments Incorporated - http://www.ti.com/
 
+#include <linux/delay.h>
 #include <linux/err.h>
 #include <linux/i2c.h>
 #include <linux/init.h>
@@ -10,12 +11,14 @@
 #include <linux/module.h>
 #include <linux/power_supply.h>
 #include <linux/regmap.h>
+#include <linux/regulator/driver.h>
 #include <linux/types.h>
 #include <linux/usb/phy.h>
 #include <linux/device.h>
 #include <linux/moduleparam.h>
 #include <linux/slab.h>
 #include <linux/acpi.h>
+#include <linux/extcon-provider.h>
 
 #define BQ256XX_MANUFACTURER "Texas Instruments"
 
@@ -72,8 +75,14 @@
 #define BQ25611D_VBATREG_THRESH_uV	4290000
 #define BQ25618_VBATREG_THRESH_uV	4300000
 
+#define BQ256XX_OTG_CONFIG_MASK		BIT(5)
+
 #define BQ256XX_CHG_CONFIG_MASK		BIT(4)
 #define BQ256XX_CHG_CONFIG_BIT_SHIFT	4
+
+#define BQ256XX_BOOST_LIM_MASK		BIT(7)
+
+#define BQ256XX_BOOSTV_MASK		GENMASK(5, 4)
 
 #define BQ256XX_ITERM_MASK		GENMASK(3, 0)
 #define BQ256XX_ITERM_STEP_uA		60000
@@ -209,6 +218,7 @@ enum bq256xx_id {
  * @client: i2c client structure
  * @regmap: register map structure
  * @dev: device structure
+ * @edev: extcon device registered to report vbus state changes
  * @charger: power supply registered for the charger
  * @battery: power supply registered for the battery
  * @lock: mutex lock structure
@@ -225,10 +235,15 @@ enum bq256xx_id {
  * @chip_info: device variant information
  * @state: device status and faults
  * @watchdog_timer: watchdog timer value in milliseconds
+ *
+ * @otg_lock: protects @otg_requested and @otg_boosting
+ * @otg_requested: OTG VBUS regulator enabled by its consumer (host mode)
+ * @otg_boosting: boost converter running (OTG_CONFIG set by the driver)
  */
 struct bq256xx_device {
 	struct i2c_client *client;
 	struct device *dev;
+	struct extcon_dev *edev;
 	struct power_supply *charger;
 	struct power_supply *battery;
 	struct mutex lock;
@@ -246,6 +261,14 @@ struct bq256xx_device {
 	const struct bq256xx_chip_info *chip_info;
 	struct bq256xx_state state;
 	int watchdog_timer;
+
+	/*
+	 * The boost stays off while an external supply powers VBUS, so the
+	 * phone keeps charging from it in host mode.
+	 */
+	struct mutex otg_lock;
+	bool otg_requested;
+	bool otg_boosting;
 };
 
 /**
@@ -280,6 +303,8 @@ struct bq256xx_device {
  * @bq256xx_max_vbatreg: maximum battery regulation voltage in microvolts
  *
  * @has_usb_detect: indicates whether device has BC1.2 detection
+ * @has_otg_vbus: indicates whether device has a boost converter usable as
+ *		  USB OTG VBUS supply
  */
 struct bq256xx_chip_info {
 	int model_id;
@@ -313,6 +338,7 @@ struct bq256xx_chip_info {
 	int bq256xx_max_vbatreg;
 
 	bool has_usb_detect;
+	bool has_otg_vbus;
 };
 
 static int bq256xx_watchdog_time[BQ256XX_NUM_WD_VAL] = {
@@ -442,7 +468,8 @@ static int bq256xx_get_state(struct bq256xx_device *bq,
 
 	state->vbus_stat = charger_status_0 & BQ256XX_VBUS_STAT_MASK;
 	state->chrg_stat = charger_status_0 & BQ256XX_CHRG_STAT_MASK;
-	state->online = charger_status_0 & BQ256XX_PG_STAT_MASK;
+	state->online = (charger_status_0 & BQ256XX_PG_STAT_MASK) &&
+			state->vbus_stat != BQ256XX_VBUS_STAT_USB_OTG;
 
 	state->wdt_fault = charger_status_1 & BQ256XX_WDT_FAULT_MASK;
 	state->bat_fault = charger_status_1 & BQ256XX_BAT_FAULT_MASK;
@@ -1166,8 +1193,14 @@ static int bq256xx_get_charger_property(struct power_supply *psy,
 	return ret;
 }
 
-static bool bq256xx_state_changed(struct bq256xx_device *bq,
-				  struct bq256xx_state *new_state)
+enum bq256xx_state_change {
+	CHANGED_NONE,
+	CHANGED_VBUS,
+	CHANGED_OTHER
+};
+
+static enum bq256xx_state_change bq256xx_state_changed(struct bq256xx_device *bq,
+						       struct bq256xx_state *new_state)
 {
 	struct bq256xx_state old_state;
 
@@ -1175,27 +1208,301 @@ static bool bq256xx_state_changed(struct bq256xx_device *bq,
 	old_state = bq->state;
 	mutex_unlock(&bq->lock);
 
-	return memcmp(&old_state, new_state, sizeof(struct bq256xx_state)) != 0;
+	if (new_state->online != old_state.online)
+		return CHANGED_VBUS;
+
+	if (memcmp(&old_state, new_state, sizeof(struct bq256xx_state)) != 0)
+		return CHANGED_OTHER;
+
+	return CHANGED_NONE;
 }
+
+static const unsigned int bq256xx_usb_extcon_cable[] = {
+	EXTCON_USB,
+	EXTCON_NONE,
+};
+
+static void bq256xx_extcon_update(struct bq256xx_device *bq, bool online)
+{
+	int ret;
+
+	if (!bq->edev)
+		return;
+
+	ret = extcon_set_state_sync(bq->edev, EXTCON_USB, online);
+	if (ret)
+		dev_err(bq->dev, "Failed to update extcon state: %d\n", ret);
+}
+
+static int bq256xx_extcon_init(struct bq256xx_device *bq)
+{
+	unsigned int charger_status_0;
+	int ret;
+
+	if (!IS_REACHABLE(CONFIG_EXTCON)) {
+		dev_dbg(bq->dev, "Extcon support is disabled\n");
+		return 0;
+	}
+
+	bq->edev = devm_extcon_dev_allocate(bq->dev, bq256xx_usb_extcon_cable);
+	if (IS_ERR(bq->edev)) {
+		dev_err(bq->dev, "Failed to allocate extcon device\n");
+		return PTR_ERR(bq->edev);
+	}
+
+	ret = devm_extcon_dev_register(bq->dev, bq->edev);
+	if (ret < 0) {
+		dev_err(bq->dev, "Failed to register extcon device\n");
+		return ret;
+	}
+
+	ret = regmap_read(bq->regmap, BQ256XX_CHARGER_STATUS_0,
+			  &charger_status_0);
+	if (ret) {
+		dev_err(bq->dev, "Failed to read charger status\n");
+		return ret;
+	}
+
+	bq256xx_extcon_update(bq, (charger_status_0 & BQ256XX_PG_STAT_MASK) &&
+			      (charger_status_0 & BQ256XX_VBUS_STAT_MASK) !=
+			      BQ256XX_VBUS_STAT_USB_OTG);
+
+	return 0;
+}
+
+#ifdef CONFIG_REGULATOR
+static const unsigned int bq256xx_otg_vbus_volt_table[] = {
+	4850000, 5000000, 5150000, 5300000,
+};
+
+static const unsigned int bq256xx_otg_vbus_curr_table[] = {
+	500000, 1200000,
+};
+
+/* Input power from outside: power good and not our own boost */
+static int bq256xx_external_vbus(struct bq256xx_device *bq, bool *external)
+{
+	unsigned int status;
+	int ret;
+
+	ret = regmap_read(bq->regmap, BQ256XX_CHARGER_STATUS_0, &status);
+	if (ret)
+		return ret;
+
+	*external = (status & BQ256XX_PG_STAT_MASK) &&
+		    (status & BQ256XX_VBUS_STAT_MASK) != BQ256XX_VBUS_STAT_USB_OTG;
+	return 0;
+}
+
+/*
+ * The device starts the boost 30 ms after OTG_CONFIG is set, and only while
+ * VBUS is below BAT + VSLEEP (datasheet 9.3.4): it never boosts into an
+ * external supply. But OTG_CONFIG also overrides CHG_CONFIG, so with the bit
+ * set and the boost refused nothing charges the battery either. Drive the
+ * bit so that it is only set while the boost actually runs.
+ */
+#define BQ256XX_BOOST_START_MS	60
+
+/* Called with otg_lock held */
+static int bq256xx_otg_apply(struct bq256xx_device *bq)
+{
+	unsigned int ctrl;
+	bool external, boost;
+	int ret;
+
+	ret = regmap_read(bq->regmap, BQ256XX_CHARGER_CONTROL_0, &ctrl);
+	if (ret)
+		return ret;
+
+	if (bq->otg_boosting && !(ctrl & BQ256XX_OTG_CONFIG_MASK)) {
+		/*
+		 * The device clears OTG_CONFIG itself on a boost fault
+		 * (overload, short, VBUS above VOTG_OVP, thermal shutdown).
+		 */
+		bq->otg_boosting = false;
+		dev_warn(bq->dev, "OTG boost stopped by the charger (fault)\n");
+		return 0;
+	}
+
+	/*
+	 * VBUS_STAT reads 111 while boosting, so a powered input is only
+	 * visible while the boost is off, or when the device refused to
+	 * start it.
+	 */
+	ret = bq256xx_external_vbus(bq, &external);
+	if (ret)
+		return ret;
+
+	boost = bq->otg_requested && !external;
+	if (boost == !!(ctrl & BQ256XX_OTG_CONFIG_MASK)) {
+		bq->otg_boosting = boost;
+		return 0;
+	}
+
+	ret = regmap_update_bits(bq->regmap, BQ256XX_CHARGER_CONTROL_0,
+				 BQ256XX_OTG_CONFIG_MASK,
+				 boost ? BQ256XX_OTG_CONFIG_MASK : 0);
+	if (ret)
+		return ret;
+	bq->otg_boosting = boost;
+
+	if (boost) {
+		/* An external supply may have come up just now: verify */
+		msleep(BQ256XX_BOOST_START_MS);
+		ret = bq256xx_external_vbus(bq, &external);
+		if (ret)
+			return ret;
+		if (external) {
+			ret = regmap_update_bits(bq->regmap,
+						 BQ256XX_CHARGER_CONTROL_0,
+						 BQ256XX_OTG_CONFIG_MASK, 0);
+			if (ret)
+				return ret;
+			bq->otg_boosting = false;
+		}
+	}
+
+	dev_dbg(bq->dev, "OTG boost %s\n", bq->otg_boosting ? "on" : "off");
+	return 0;
+}
+
+static int bq256xx_otg_vbus_enable(struct regulator_dev *rdev)
+{
+	struct bq256xx_device *bq = rdev_get_drvdata(rdev);
+	bool external = false;
+	int i, ret;
+
+	/*
+	 * The ID pin and an external supply usually arrive together on the
+	 * same plug; give the charger time to report power good first.
+	 */
+	for (i = 0; i < 6; i++) {
+		ret = bq256xx_external_vbus(bq, &external);
+		if (ret || external)
+			break;
+		msleep(50);
+	}
+
+	mutex_lock(&bq->otg_lock);
+	bq->otg_requested = true;
+	ret = bq256xx_otg_apply(bq);
+	if (!ret && !bq->otg_boosting)
+		dev_info(bq->dev, "External VBUS present, OTG boost not started\n");
+	mutex_unlock(&bq->otg_lock);
+
+	return ret;
+}
+
+static int bq256xx_otg_vbus_disable(struct regulator_dev *rdev)
+{
+	struct bq256xx_device *bq = rdev_get_drvdata(rdev);
+	int ret;
+
+	mutex_lock(&bq->otg_lock);
+	bq->otg_requested = false;
+	ret = bq256xx_otg_apply(bq);
+	mutex_unlock(&bq->otg_lock);
+
+	return ret;
+}
+
+static int bq256xx_otg_vbus_is_enabled(struct regulator_dev *rdev)
+{
+	struct bq256xx_device *bq = rdev_get_drvdata(rdev);
+
+	return bq->otg_requested;
+}
+
+static const struct regulator_ops bq256xx_otg_vbus_ops = {
+	.enable = bq256xx_otg_vbus_enable,
+	.disable = bq256xx_otg_vbus_disable,
+	.is_enabled = bq256xx_otg_vbus_is_enabled,
+	.list_voltage = regulator_list_voltage_table,
+	.map_voltage = regulator_map_voltage_ascend,
+	.get_voltage_sel = regulator_get_voltage_sel_regmap,
+	.set_voltage_sel = regulator_set_voltage_sel_regmap,
+	.get_current_limit = regulator_get_current_limit_regmap,
+	.set_current_limit = regulator_set_current_limit_regmap,
+};
+
+static const struct regulator_desc bq256xx_otg_vbus_desc = {
+	.name = "usb_otg_vbus",
+	.of_match = "usb-otg-vbus",
+	.type = REGULATOR_VOLTAGE,
+	.owner = THIS_MODULE,
+	.ops = &bq256xx_otg_vbus_ops,
+	.volt_table = bq256xx_otg_vbus_volt_table,
+	.n_voltages = ARRAY_SIZE(bq256xx_otg_vbus_volt_table),
+	.vsel_reg = BQ256XX_CHARGER_CONTROL_2,
+	.vsel_mask = BQ256XX_BOOSTV_MASK,
+	.curr_table = bq256xx_otg_vbus_curr_table,
+	.n_current_limits = ARRAY_SIZE(bq256xx_otg_vbus_curr_table),
+	.csel_reg = BQ256XX_CHARGE_CURRENT_LIMIT,
+	.csel_mask = BQ256XX_BOOST_LIM_MASK,
+	/* OTG_CONFIG (set by bq256xx_otg_apply) overrides CHG_CONFIG */
+};
+
+static int bq256xx_otg_vbus_init(struct bq256xx_device *bq)
+{
+	struct regulator_config cfg = {
+		.dev = bq->dev,
+		.driver_data = bq,
+		.regmap = bq->regmap,
+	};
+	struct regulator_dev *rdev;
+
+	if (!bq->chip_info->has_otg_vbus)
+		return 0;
+
+	rdev = devm_regulator_register(bq->dev, &bq256xx_otg_vbus_desc, &cfg);
+	if (IS_ERR(rdev))
+		return dev_err_probe(bq->dev, PTR_ERR(rdev),
+				     "Failed to register OTG VBUS regulator\n");
+
+	return 0;
+}
+#else
+static int bq256xx_otg_vbus_init(struct bq256xx_device *bq)
+{
+	return 0;
+}
+#endif
 
 static irqreturn_t bq256xx_irq_handler_thread(int irq, void *private)
 {
 	struct bq256xx_device *bq = private;
 	struct bq256xx_state state;
+	enum bq256xx_state_change changed;
 	int ret;
 
 	ret = bq256xx_get_state(bq, &state);
 	if (ret < 0)
 		goto irq_out;
 
-	if (!bq256xx_state_changed(bq, &state))
+#ifdef CONFIG_REGULATOR
+	/* Input appeared or went away: start or stop the OTG boost */
+	if (bq->chip_info->has_otg_vbus) {
+		mutex_lock(&bq->otg_lock);
+		bq256xx_otg_apply(bq);
+		mutex_unlock(&bq->otg_lock);
+	}
+#endif
+
+	changed = bq256xx_state_changed(bq, &state);
+	switch (changed) {
+	case CHANGED_NONE:
 		goto irq_out;
 
-	mutex_lock(&bq->lock);
-	bq->state = state;
-	mutex_unlock(&bq->lock);
+	case CHANGED_VBUS:
+		bq256xx_extcon_update(bq, state.online);
+		fallthrough;
+	case CHANGED_OTHER:
+		mutex_lock(&bq->lock);
+		bq->state = state;
+		mutex_unlock(&bq->lock);
 
-	power_supply_changed(bq->charger);
+		power_supply_changed(bq->charger);
+	}
 
 irq_out:
 	return IRQ_HANDLED;
@@ -1269,6 +1576,8 @@ static bool bq256xx_is_volatile_reg(struct device *dev, unsigned int reg)
 {
 	switch (reg) {
 	case BQ256XX_INPUT_CURRENT_LIMIT:
+	/* OTG_CONFIG is cleared by the device on boost faults */
+	case BQ256XX_CHARGER_CONTROL_0:
 	case BQ256XX_CHARGER_STATUS_0...BQ256XX_CHARGER_STATUS_2:
 		return true;
 	default:
@@ -1340,6 +1649,7 @@ static const struct bq256xx_chip_info bq256xx_chip_info_tbl[] = {
 		.bq256xx_max_vbatreg = BQ2560X_VBATREG_MAX_uV,
 
 		.has_usb_detect = false,
+		.has_otg_vbus = true,
 	},
 
 	[BQ25600D] = {
@@ -1372,6 +1682,7 @@ static const struct bq256xx_chip_info bq256xx_chip_info_tbl[] = {
 		.bq256xx_max_vbatreg = BQ2560X_VBATREG_MAX_uV,
 
 		.has_usb_detect = true,
+		.has_otg_vbus = true,
 	},
 
 	[BQ25601] = {
@@ -1404,6 +1715,7 @@ static const struct bq256xx_chip_info bq256xx_chip_info_tbl[] = {
 		.bq256xx_max_vbatreg = BQ2560X_VBATREG_MAX_uV,
 
 		.has_usb_detect = false,
+		.has_otg_vbus = true,
 	},
 
 	[BQ25601D] = {
@@ -1436,6 +1748,7 @@ static const struct bq256xx_chip_info bq256xx_chip_info_tbl[] = {
 		.bq256xx_max_vbatreg = BQ2560X_VBATREG_MAX_uV,
 
 		.has_usb_detect = true,
+		.has_otg_vbus = true,
 	},
 
 	[BQ25611D] = {
@@ -1704,6 +2017,7 @@ static int bq256xx_probe(struct i2c_client *client)
 	bq->chip_info = i2c_get_match_data(client);
 
 	mutex_init(&bq->lock);
+	mutex_init(&bq->otg_lock);
 
 	strscpy(bq->model_name, id->name, sizeof(bq->model_name));
 
@@ -1748,6 +2062,12 @@ static int bq256xx_probe(struct i2c_client *client)
 		return ret;
 	}
 
+	ret = bq256xx_extcon_init(bq);
+	if (ret) {
+		dev_err(dev, "Failed to register extcon device\n");
+		return ret;
+	}
+
 	if (client->irq) {
 		ret = devm_request_threaded_irq(dev, client->irq, NULL,
 						bq256xx_irq_handler_thread,
@@ -1765,6 +2085,10 @@ static int bq256xx_probe(struct i2c_client *client)
 		dev_err(dev, "Cannot initialize the chip.\n");
 		return ret;
 	}
+
+	ret = bq256xx_otg_vbus_init(bq);
+	if (ret)
+		return ret;
 
 	return ret;
 }

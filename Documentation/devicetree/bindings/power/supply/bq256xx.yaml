@@ -76,6 +76,13 @@ properties:
     type: boolean
     description: Indicates that no thermistor is connected to the TS pin
 
+  usb-otg-vbus:
+    $ref: /schemas/regulator/regulator.yaml#
+    unevaluatedProperties: false
+    description: |
+      Regulator for the boost converter that supplies VBUS when the USB port
+      operates in host mode.
+
 required:
   - compatible
   - reg
@@ -95,6 +102,9 @@ allOf:
     then:
       properties:
         ti,no-thermistor: false
+    else:
+      properties:
+        usb-otg-vbus: false
 
 additionalProperties: false
 
@@ -127,6 +137,14 @@ examples:
 
         input-voltage-limit-microvolt = <4500000>;
         input-current-limit-microamp = <2400000>;
+
+        usb-otg-vbus {
+          regulator-name = "usb_otg_vbus";
+          regulator-min-microvolt = <5000000>;
+          regulator-max-microvolt = <5000000>;
+          regulator-min-microamp = <500000>;
+          regulator-max-microamp = <500000>;
+        };
        };
     };
 ...
