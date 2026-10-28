@@ -39,6 +39,67 @@ static const struct iio_chan_spec qcom_smgr_prox_iio_channels[] = {
 	},
 };
 
+static const struct iio_chan_spec qcom_smgr_light_iio_channels[] = {
+	{
+		.type = IIO_LIGHT,
+		.scan_index = 0,
+		.scan_type = {
+			.sign = 'u',
+			.realbits = 32,
+			.storagebits = 32,
+			.endianness = IIO_LE,
+		},
+		.info_mask_separate = BIT(IIO_CHAN_INFO_SCALE) |
+				      BIT(IIO_CHAN_INFO_SAMP_FREQ)
+	},
+	{
+		.type = IIO_TIMESTAMP,
+		.channel = -1,
+		.scan_index = 3,
+		.scan_type = {
+			.sign = 'u',
+			.realbits = 32,
+			.storagebits = 64,
+			.endianness = IIO_LE,
+		},
+	},
+};
+
+/* The secondary data type of a prox-light sensor is ambient light in lux */
+static int qcom_smgr_light_register(struct platform_device *pdev,
+				    struct qcom_smgr_sensor *sensor)
+{
+	struct iio_dev *iio_dev;
+	struct qcom_smgr_iio_priv *priv;
+	int ret;
+
+	iio_dev = devm_iio_device_alloc(&pdev->dev, sizeof(*priv));
+	if (!iio_dev)
+		return -ENOMEM;
+
+	priv = iio_priv(iio_dev);
+	priv->sensor = sensor;
+	priv->data_type = SNS_SMGR_DATA_TYPE_SECONDARY;
+
+	iio_dev->name = "qcom-smgr-light";
+	iio_dev->info = &qcom_smgr_iio_info;
+	iio_dev->channels = qcom_smgr_light_iio_channels;
+	iio_dev->num_channels = ARRAY_SIZE(qcom_smgr_light_iio_channels);
+
+	ret = devm_iio_kfifo_buffer_setup(&pdev->dev, iio_dev,
+					  &qcom_smgr_buffer_ops);
+	if (ret)
+		return ret;
+
+	ret = devm_iio_device_register(&pdev->dev, iio_dev);
+	if (ret)
+		return ret;
+
+	sensor->iio_dev_secondary = iio_dev;
+
+	return 0;
+}
+
 static int qcom_smgr_prox_probe(struct platform_device *pdev)
 {
 	struct iio_dev *iio_dev;
@@ -73,6 +134,13 @@ static int qcom_smgr_prox_probe(struct platform_device *pdev)
 		return ret;
 	}
 
+	if (priv->sensor->data_type_count > SNS_SMGR_DATA_TYPE_SECONDARY) {
+		ret = qcom_smgr_light_register(pdev, priv->sensor);
+		if (ret)
+			dev_warn(&pdev->dev, "Failed to register light sensor: %pe\n",
+				 ERR_PTR(ret));
+	}
+
 	platform_set_drvdata(pdev, priv->sensor);
 
 	return 0;
@@ -83,6 +151,7 @@ static void qcom_smgr_prox_remove(struct platform_device *pdev)
 	struct qcom_smgr_sensor *sensor = platform_get_drvdata(pdev);
 
 	sensor->iio_dev = NULL;
+	sensor->iio_dev_secondary = NULL;
 }
 
 static const struct platform_device_id qcom_smgr_prox_ids[] = {
@@ -102,5 +171,5 @@ static struct platform_driver qcom_smgr_prox_driver = {
 module_platform_driver(qcom_smgr_prox_driver);
 
 MODULE_AUTHOR("Yassine Oudjana <y.oudjana@protonmail.com>");
-MODULE_DESCRIPTION("Qualcomm Sensor Manager proximity sensor driver");
+MODULE_DESCRIPTION("Qualcomm Sensor Manager proximity and light sensor driver");
 MODULE_LICENSE("GPL");

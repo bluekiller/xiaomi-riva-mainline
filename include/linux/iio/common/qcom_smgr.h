@@ -45,16 +45,18 @@ struct qcom_smgr_sensor {
 
 	u8 data_type_count;
 	/*
-	 * Only SNS_SMGR_DATA_TYPE_PRIMARY is used at the moment, but we store
-	 * SNS_SMGR_DATA_TYPE_SECONDARY when available as well for future use.
+	 * SNS_SMGR_DATA_TYPE_SECONDARY, when available, is streamed through
+	 * iio_dev_secondary (e.g. ambient light of a prox-light sensor).
 	 */
 	struct qcom_smgr_data_type_item *data_types;
 
 	struct iio_dev *iio_dev;
+	struct iio_dev *iio_dev_secondary;
 };
 
 struct qcom_smgr_iio_priv {
 	struct qcom_smgr_sensor *sensor;
+	enum qcom_smgr_data_type data_type;
 };
 
 extern const struct iio_buffer_setup_ops qcom_smgr_buffer_ops;
