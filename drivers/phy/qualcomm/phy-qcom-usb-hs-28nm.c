@@ -6,6 +6,7 @@
 
 #include <linux/clk.h>
 #include <linux/delay.h>
+#include <linux/extcon-provider.h>
 #include <linux/io.h>
 #include <linux/kernel.h>
 #include <linux/module.h>
@@ -16,13 +17,19 @@
 #include <linux/regulator/consumer.h>
 #include <linux/reset.h>
 #include <linux/slab.h>
+#include <linux/workqueue.h>
 
 /* PHY register and bit definitions */
 #define PHY_CTRL_COMMON0		0x078
 #define SIDDQ				BIT(2)
+#define PHY_INTR_SRC_STATUS		0x05c
+#define IDDIG_1_0			BIT(7)
 #define PHY_IRQ_CMD			0x0d0
 #define PHY_INTR_MASK0			0x0d4
+#define PHY_INTR_MASK1			0x0d8
 #define PHY_INTR_CLEAR0			0x0dc
+#define PHY_INTR_CLEAR1			0x0e0
+#define IDDIG_MASK			0x03
 #define DPDM_MASK			0x1e
 #define DP_1_0				BIT(4)
 #define DP_0_1				BIT(3)
@@ -63,7 +70,110 @@ struct hsphy_priv {
 	struct regulator_bulk_data vregs[VREG_NUM];
 	const struct hsphy_data *data;
 	enum phy_mode mode;
+
+	/*
+	 * ID pin detection (qcom,id-detect): the USB ID pin ends at this PHY,
+	 * whose IDDIG status does not reach the controller's OTGSC on its own.
+	 * Poll it and report it as an EXTCON_USB_HOST cable. The registers
+	 * are only touched while the PHY is clocked (init) and out of
+	 * retention (powered): accessing them otherwise stalls the bus.
+	 */
+	struct extcon_dev *id_edev;
+	struct delayed_work id_work;
+	struct mutex id_lock;
+	bool clocked;
+	bool powered;
+	int id_host;
 };
+
+#define ID_POLL_MS	500
+
+static const unsigned int qcom_snps_hsphy_cables[] = {
+	EXTCON_USB_HOST,
+	EXTCON_NONE,
+};
+
+static void qcom_snps_hsphy_set_state(struct hsphy_priv *priv, bool clocked,
+				      bool powered)
+{
+	if (!priv->id_edev)
+		return;
+
+	mutex_lock(&priv->id_lock);
+	priv->clocked = clocked;
+	priv->powered = powered;
+	mutex_unlock(&priv->id_lock);
+}
+
+static void qcom_snps_hsphy_id_work(struct work_struct *work)
+{
+	struct hsphy_priv *priv = container_of(to_delayed_work(work),
+					       struct hsphy_priv, id_work);
+	int host = -1;
+
+	mutex_lock(&priv->id_lock);
+	if (priv->clocked && priv->powered) {
+		/*
+		 * The IDDIG sources must be enabled for the ID status to be
+		 * tracked, and every PHY reset (the controller re-inits the
+		 * PHY when it switches roles) clears them.
+		 */
+		if ((readb(priv->base + PHY_INTR_MASK1) & IDDIG_MASK) != IDDIG_MASK)
+			writeb(IDDIG_MASK, priv->base + PHY_INTR_MASK1);
+
+		/* Clear the latched IDDIG interrupts, then read the source */
+		writeb(IDDIG_MASK, priv->base + PHY_INTR_CLEAR1);
+		writeb(0x1, priv->base + PHY_IRQ_CMD);
+		usleep_range(200, 220);
+		writeb(0x0, priv->base + PHY_IRQ_CMD);
+
+		/* IDDIG 1 -> 0: the ID pin is grounded (OTG adapter) */
+		host = !!(readb(priv->base + PHY_INTR_SRC_STATUS) & IDDIG_1_0);
+	}
+	mutex_unlock(&priv->id_lock);
+
+	/* Outside the lock: the extcon notifier may call back into the PHY */
+	if (host >= 0 && host != priv->id_host) {
+		priv->id_host = host;
+		extcon_set_state_sync(priv->id_edev, EXTCON_USB_HOST, host);
+	}
+
+	schedule_delayed_work(&priv->id_work, msecs_to_jiffies(ID_POLL_MS));
+}
+
+static void qcom_snps_hsphy_id_cancel(void *data)
+{
+	struct hsphy_priv *priv = data;
+
+	cancel_delayed_work_sync(&priv->id_work);
+}
+
+static int qcom_snps_hsphy_id_init(struct device *dev, struct hsphy_priv *priv)
+{
+	int ret;
+
+	if (!of_property_read_bool(dev->of_node, "qcom,id-detect"))
+		return 0;
+
+	priv->id_edev = devm_extcon_dev_allocate(dev, qcom_snps_hsphy_cables);
+	if (IS_ERR(priv->id_edev))
+		return PTR_ERR(priv->id_edev);
+
+	ret = devm_extcon_dev_register(dev, priv->id_edev);
+	if (ret)
+		return ret;
+
+	mutex_init(&priv->id_lock);
+	priv->id_host = 0;
+	INIT_DELAYED_WORK(&priv->id_work, qcom_snps_hsphy_id_work);
+	ret = devm_add_action_or_reset(dev, qcom_snps_hsphy_id_cancel, priv);
+	if (ret)
+		return ret;
+
+	schedule_delayed_work(&priv->id_work, msecs_to_jiffies(ID_POLL_MS));
+
+	return 0;
+}
 
 static int qcom_snps_hsphy_set_mode(struct phy *phy, enum phy_mode mode,
 				    int submode)
@@ -163,6 +273,7 @@ static int qcom_snps_hsphy_power_on(struct phy *phy)
 
 	qcom_snps_hsphy_disable_hv_interrupts(priv);
 	qcom_snps_hsphy_exit_retention(priv);
+	qcom_snps_hsphy_set_state(priv, priv->clocked, true);
 
 	return 0;
 }
@@ -171,6 +282,7 @@ static int qcom_snps_hsphy_power_off(struct phy *phy)
 {
 	struct hsphy_priv *priv = phy_get_drvdata(phy);
 
+	qcom_snps_hsphy_set_state(priv, priv->clocked, false);
 	qcom_snps_hsphy_enter_retention(priv);
 	qcom_snps_hsphy_enable_hv_interrupts(priv);
 	regulator_bulk_disable(VREG_NUM, priv->vregs);
@@ -272,6 +384,11 @@ static int qcom_snps_hsphy_init(struct phy *phy)
 	if (ret)
 		goto disable_clocks;
 
+	/* Enable the IDDIG sources again after the reset (see id_work) */
+	if (priv->id_edev)
+		writeb(IDDIG_MASK, priv->base + PHY_INTR_MASK1);
+	qcom_snps_hsphy_set_state(priv, true, priv->powered);
+
 	return 0;
 
 disable_clocks:
@@ -283,6 +400,7 @@ static int qcom_snps_hsphy_exit(struct phy *phy)
 {
 	struct hsphy_priv *priv = phy_get_drvdata(phy);
 
+	qcom_snps_hsphy_set_state(priv, false, priv->powered);
 	clk_bulk_disable_unprepare(priv->num_clks, priv->clks);
 
 	return 0;
@@ -351,6 +469,11 @@ static int qcom_snps_hsphy_probe(struct platform_device *pdev)
 
 	/* Get device match data */
 	priv->data = device_get_match_data(dev);
+
+	/* Before the PHY is created, so no init/power_on can be missed */
+	ret = qcom_snps_hsphy_id_init(dev, priv);
+	if (ret)
+		return dev_err_probe(dev, ret, "failed to set up ID detection\n");
 
 	phy = devm_phy_create(dev, dev->of_node, &qcom_snps_hsphy_ops);
 	if (IS_ERR(phy))

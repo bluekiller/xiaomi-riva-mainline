@@ -54,6 +54,13 @@ properties:
   vdda3p3-supply:
     description: phandle to the regulator 3.3V supply node.
 
+  qcom,id-detect:
+    type: boolean
+    description:
+      The USB ID pin is wired to this PHY only. The PHY then reports the
+      ID state as an extcon device (EXTCON_USB_HOST), which the USB
+      controller references as its ID extcon.
+
 required:
   - compatible
   - reg
