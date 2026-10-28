@@ -31,10 +31,12 @@
 	power-monitor@55 {
 		compatible = "ti,bq27426";
 		reg = <0x55>;
+		/* /sys/class/power_supply/battery: found by psutil (KlipperScreen) */
+		label = "battery";
 		monitored-battery = <&battery>;
 	};
 
-	charger@6b {
+	bq25601_charger: charger@6b {
 		compatible = "ti,bq25601";
 		reg = <0x6b>;
 		interrupts-extended = <&tlmm 61 IRQ_TYPE_EDGE_FALLING>;
@@ -46,6 +48,14 @@
 
 		// TODO: remove when power-supplies property is fixed
 		omit-battery-class;
+
+		usb_otg_vbus: usb-otg-vbus {
+			regulator-name = "usb_otg_vbus";
+			regulator-min-microvolt = <5000000>;
+			regulator-max-microvolt = <5000000>;
+			regulator-min-microamp = <500000>;
+			regulator-max-microamp = <500000>;
+		};
 	};
 };
 
@@ -55,6 +65,28 @@
 
 &sound {
 	model = "xiaomi-riva";
+	/*
+	 * Feed the speaker amplifier and the headphone switch from the codec
+	 * output pins (after the HPH PAs), not from the HPHL/HPHR muxes in
+	 * front of them: then DAPM switches the AW8738 on after the PA and
+	 * off before it, instead of keeping the amplifier on all the time
+	 * while the PA powers up and down behind it (a pop on every stream
+	 * open and close).
+	 */
+	audio-routing =
+		"Speaker", "Speaker Amp OUT",
+		"Speaker Amp IN", "HPH_R",
+		"Headphones", "Headphones Switch OUTL",
+		"Headphones", "Headphones Switch OUTR",
+		"Headphones Switch INL", "HPH_L",
+		"Headphones Switch INR", "HPH_R",
+		"AMIC1", "MIC BIAS External1",
+		"AMIC2", "MIC BIAS Internal2",
+		"AMIC3", "MIC BIAS External1",
+		"MM_DL1", "MultiMedia1 Playback",
+		"MM_DL3", "MultiMedia3 Playback",
+		"MM_DL4", "MultiMedia4 Playback",
+		"MultiMedia2 Capture", "MM_UL2";
 };
 
 &speaker_amp {
@@ -70,4 +102,23 @@
 		drive-strength = <2>;
 		bias-pull-up;
 	};
+};
+
+&usb {
+	dr_mode = "otg";
+	/* VBUS from the charger, ID from the PHY (the ID pin ends there) */
+	extcon = <&bq25601_charger>, <&usb_hs_phy>;
+	vbus-supply = <&usb_otg_vbus>;
+
+	status = "okay";
+};
+
+&usb_hs_phy {
+	vdd-supply = <&pm8937_l2>;
+	vdda1p8-supply = <&pm8937_l7>;
+	vdda3p3-supply = <&pm8937_l13>;
+
+	qcom,id-detect;
+
+	status = "okay";
 };
