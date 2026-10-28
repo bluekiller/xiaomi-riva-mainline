@@ -59,6 +59,11 @@ properties:
     maxItems: 1
     description: the SOC_INT or GPOUT pin
 
+  label:
+    description:
+      Name of the power supply device; defaults to the chip name and an
+      instance number, e.g. bq27426-0.
+
   monitored-battery:
     description: |
        The fuel gauge uses the following battery properties:

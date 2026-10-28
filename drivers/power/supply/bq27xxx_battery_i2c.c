@@ -10,6 +10,7 @@
 #include <linux/i2c.h>
 #include <linux/interrupt.h>
 #include <linux/module.h>
+#include <linux/property.h>
 #include <linux/unaligned.h>
 
 #include <linux/power/bq27xxx_battery.h>
@@ -157,6 +158,7 @@ static int bq27xxx_battery_i2c_probe(struct i2c_client *client)
 {
 	const struct i2c_device_id *id = i2c_client_get_device_id(client);
 	struct bq27xxx_device_info *di;
+	const char *label;
 	int ret;
 	char *name;
 	long num;
@@ -171,7 +173,11 @@ static int bq27xxx_battery_i2c_probe(struct i2c_client *client)
 	if (ret)
 		return ret;
 
-	name = devm_kasprintf(&client->dev, GFP_KERNEL, "%s-%ld", id->name, num);
+	if (!device_property_read_string(&client->dev, "label", &label))
+		name = devm_kstrdup(&client->dev, label, GFP_KERNEL);
+	else
+		name = devm_kasprintf(&client->dev, GFP_KERNEL, "%s-%ld",
+				      id->name, num);
 	if (!name)
 		return -ENOMEM;
 
