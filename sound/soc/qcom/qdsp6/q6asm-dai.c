@@ -222,6 +222,13 @@ static int q6asm_dai_prepare(struct snd_soc_component *component,
 	}
 
 	prtd->pcm_count = snd_pcm_lib_period_bytes(substream);
+	/*
+	 * Prepare restarts the stream at position 0 (the core resets hw_ptr,
+	 * then appl_ptr to it). A queue_ptr left at the old position makes
+	 * appl_ptr - queue_ptr wrap in .ack, so no period is queued again and
+	 * playback stalls after a re-prepare (drain + prepare, xrun recovery).
+	 */
+	prtd->queue_ptr = 0;
 	/* rate and channels are sent to audio driver */
 	if (prtd->state == Q6ASM_STREAM_RUNNING) {
 		/* clear the previous setup if any  */

@@ -525,6 +525,14 @@ int q6asm_map_memory_regions(unsigned int dir, struct audio_client *ac,
 		}
 	}
 	ac->port[dir].num_periods = periods;
+	/*
+	 * A fresh mapping starts at the first buffer: q6asm-dai remaps on every
+	 * prepare, where ALSA restarts the stream at position 0, so a buffer
+	 * index or position left over from the previous stream would feed and
+	 * report the wrong periods.
+	 */
+	ac->port[dir].dsp_buf = 0;
+	atomic_set(&ac->port[dir].hw_ptr, 0);
 
 	spin_unlock_irqrestore(&ac->lock, flags);
 
